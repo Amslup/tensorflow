@@ -117,6 +117,8 @@ struct ArgumentSignature {
   }
 
   std::string DebugString() const;
+
+  int tp_traverse(visitproc visit, void* arg) const;
 };
 
 template <typename H>
@@ -221,6 +223,8 @@ struct CallSignature {
   }
 
   std::string DebugString() const;
+
+  int tp_traverse(visitproc visit, void* arg) const;
 };
 
 template <typename H>
