@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <utility>
 
 #include "absl/base/optimization.h"
@@ -79,20 +80,49 @@ ParallelLoopRunner::ComputeParallelTaskConfig(size_t num_tasks) const {
   return {num_tasks, parallel_task_size, num_parallel_tasks};
 }
 
-void ParallelLoopRunner::Parallelize(
-    tsl::CountDownAsyncValueRef<tsl::Chain> count_down, size_t start_index,
-    size_t end_index, ParallelTask parallel_task) {
+template <typename ParallelizeContext>
+static void ParallelizeImpl(ParallelizeContext* ctx, uint16_t start_index,
+                            uint16_t end_index) {
   CHECK_LT(start_index, end_index) << "Invalid task index range";  // Crash OK
+
+  // Recursively split the task into two halves and schedule the right half into
+  // the thread pool.
   while (end_index - start_index > 1) {
-    uint64_t mid_index = (start_index + end_index) / 2;
-    device_.load()->enqueueNoNotification([this, mid_index, end_index,
-                                           parallel_task, count_down] {
-      Parallelize(std::move(count_down), mid_index, end_index, parallel_task);
+    uint16_t mid_index = (start_index + end_index) / 2;
+    ctx->device->enqueueNoNotification([ctx, mid_index, end_index] {
+      ParallelizeImpl(ctx, mid_index, end_index);
     });
     end_index = mid_index;
   }
-  parallel_task(start_index);
-  count_down.CountDown();
+
+  // Execute the `start_index` task in the caller thread.
+  ctx->parallel_task(start_index);
+
+  // If count down is completed, delete the context.
+  if (ctx->count_down.CountDown()) {
+    delete ctx;
+  }
+}
+
+template <typename ParallelTask>
+void ParallelLoopRunner::Parallelize(
+    tsl::CountDownAsyncValueRef<tsl::Chain> count_down, size_t start_index,
+    size_t end_index, ParallelTask&& parallel_task) {
+  CHECK_LT(start_index, end_index) << "Invalid task index range";  // Crash OK
+  CHECK_LT(start_index, std::numeric_limits<uint16_t>::max());     // Crash OK
+  CHECK_LT(end_index, std::numeric_limits<uint16_t>::max());       // Crash OK
+
+  struct ParallelizeContext {
+    tsl::CountDownAsyncValueRef<tsl::Chain> count_down;
+    const Eigen::ThreadPoolDevice* device;
+    ParallelTask parallel_task;
+  };
+
+  auto ctx = std::make_unique<ParallelizeContext>(
+      std::move(count_down), device_,
+      std::forward<ParallelTask>(parallel_task));
+
+  ParallelizeImpl(ctx.release(), start_index, end_index);
 }
 
 template <typename Task>
