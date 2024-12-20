@@ -23,72 +23,56 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_module.h"
-#include "xla/hlo/parser/hlo_parser.h"
+#include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/utils/hlo_matchers.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/service/collective_ops_utils.h"
 #include "xla/service/gpu/backend_configs.pb.h"
-#include "xla/tests/hlo_test_base.h"
-#include "tsl/platform/statusor.h"
+#include "xla/tsl/lib/core/status_test_util.h"
+#include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace {
 
+using absl::string_view;
+using std::unique_ptr;
 using ::testing::ElementsAre;
 using ::testing::HasSubstr;
+
 namespace op = xla::testing::opcode_matchers;
-using CollectivePermuteDecomposerTest = HloTestBase;
+using Pass = CollectivePermuteDecomposer;
+
+class CollectivePermuteDecomposerTest : public HloHardwareIndependentTestBase {
+ protected:
+  void AssertNoTranform(absl::string_view hlo) {
+    TF_ASSERT_OK(RunAndCheckHloRewrite(hlo, Pass(0), false));
+  };
+  auto Transform(absl::string_view hlo) {
+    return RunAndCheckHloRewrite(hlo, Pass(0), true);
+  };
+};
 
 TEST_F(CollectivePermuteDecomposerTest, WithCycleNotTransformed) {
-  const absl::string_view kModuleStr = R"(
-      HloModule test
-      ENTRY test_computation {
-        p = u32[] replica-id()
-        ROOT cp = u32[] collective-permute(p), channel_id=1,
-          source_target_pairs={{0,1}, {1,0}}
-      }
-    )";
-
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnUnverifiedModule((kModuleStr)));
-  CollectivePermuteDecomposer decomposer(/*threshold_in_bytes=*/0);
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, decomposer.Run(module.get()));
-  EXPECT_FALSE(changed);
-}
-
-TEST_F(CollectivePermuteDecomposerTest, WithContextDataNotTransformed) {
-  const char* const kModuleStr = R"(
-  HloModule test
-  ENTRY test_computation {
-    p = u32[] replica-id()
-    ROOT cp = (u32[], u32[], u32[], u32[]) collective-permute(p), channel_id=1,
-      source_target_pairs={{0,1}, {1,2}, {2,3}, {3,4}}
-  }
-  )";
-
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnUnverifiedModule((kModuleStr)));
-  CollectivePermuteDecomposer decomposer(/*threshold_in_bytes=*/0);
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, decomposer.Run(module.get()));
-  EXPECT_FALSE(changed);
+  AssertNoTranform(R"(HloModule test
+    ENTRY test_computation {
+      p = u32[] replica-id()
+      ROOT cp = u32[] collective-permute(p), channel_id=1,
+        source_target_pairs={{0,1}, {1,0}}
+    }
+  )");
 }
 
 TEST_F(CollectivePermuteDecomposerTest, TransformedExplicitChannelId) {
-  const char* const kModuleStr = R"(
-  HloModule test
-  ENTRY test_computation {
-    p = u32[] replica-id()
-    ROOT cp = u32[] collective-permute(p), channel_id=1,
-      source_target_pairs={{0,1}, {1,2}, {2,3}, {3,4}},
-      metadata={op_name="op1/op2/add" source_file="foo/bar/mysource.py" source_line=35}
-  }
+  string_view hlo = R"(
+    HloModule test
+    ENTRY test_computation {
+      p = u32[] replica-id()
+      ROOT cp = u32[] collective-permute(p), channel_id=1,
+        source_target_pairs={{0,1}, {1,2}, {2,3}, {3,4}},
+        metadata={op_name="op1/op2/add" source_file="foo/bar/mysource.py" source_line=35}
+    }
   )";
-
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnUnverifiedModule((kModuleStr)));
-  CollectivePermuteDecomposer decomposer(/*threshold_in_bytes=*/0);
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, decomposer.Run(module.get()));
-  EXPECT_TRUE(changed);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module, Transform(hlo));
 
   auto check_metadata = [](const HloInstruction* inst) {
     EXPECT_EQ(inst->metadata().op_name(), "op1/op2/add");
@@ -131,8 +115,8 @@ TEST_F(CollectivePermuteDecomposerTest, TransformedExplicitChannelId) {
   EXPECT_THAT(root, op::GetTupleElement(recv_done, 0));
 }
 
-TEST_F(CollectivePermuteDecomposerTest, NotTransformedDefaultChannelId) {
-  const char* const kModuleStr = R"(
+TEST_F(CollectivePermuteDecomposerTest, TransformedDefaultNoChannelId) {
+  string_view hlo = R"(
   HloModule test
   ENTRY test_computation {
     p = u32[] replica-id()
@@ -141,11 +125,7 @@ TEST_F(CollectivePermuteDecomposerTest, NotTransformedDefaultChannelId) {
   }
   )";
 
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnUnverifiedModule((kModuleStr)));
-  CollectivePermuteDecomposer decomposer(/*threshold_in_bytes=*/0);
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, decomposer.Run(module.get()));
-  EXPECT_TRUE(changed);
+  TF_ASSERT_OK_AND_ASSIGN(unique_ptr<HloModule> module, Transform(hlo));
 
   HloInstruction* after_all = FindInstruction(module.get(), "after-all");
   HloInstruction* recv = FindInstruction(module.get(), "recv");
@@ -173,25 +153,19 @@ TEST_F(CollectivePermuteDecomposerTest, NotTransformedDefaultChannelId) {
 }
 
 TEST_F(CollectivePermuteDecomposerTest, ThresholdNotTransformed) {
-  const char* const kModuleStr = R"(
-  HloModule test
-  ENTRY test_computation {
-    p = u32[] replica-id()
-    ROOT cp = u32[] collective-permute(p), channel_id=1,
-      source_target_pairs={{0,1}, {1,2}, {2,3}, {3,4}},
-      metadata={op_name="op1/op2/add" source_file="foo/bar/mysource.py" source_line=35}
-  }
-  )";
-
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnUnverifiedModule((kModuleStr)));
-  CollectivePermuteDecomposer decomposer(/*threshold_in_bytes=*/8);
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, decomposer.Run(module.get()));
-  EXPECT_FALSE(changed);
+  string_view hlo = R"(HloModule test
+    ENTRY test_computation {
+      p = u32[] replica-id()
+      ROOT cp = u32[] collective-permute(p), channel_id=1,
+        source_target_pairs={{0,1}, {1,2}, {2,3}, {3,4}},
+        metadata={op_name="op1/op2/add" source_file="foo/bar/mysource.py" source_line=35}
+    })";
+  TF_ASSERT_OK(
+      RunAndCheckHloRewrite(hlo, Pass(/*threshold_in_bytes=*/8), false));
 }
 
 TEST_F(CollectivePermuteDecomposerTest, Pipeline1) {
-  const char* const kModuleStr = R"(
+  string_view hlo = R"(
   HloModule module
   cond {
     param = (u32[], u32[2]) parameter(0)
@@ -229,11 +203,7 @@ TEST_F(CollectivePermuteDecomposerTest, Pipeline1) {
     ROOT result = u32[2] get-tuple-element(while_result), index=1
   })";
 
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnUnverifiedModule((kModuleStr)));
-  CollectivePermuteDecomposer decomposer(/*threshold_in_bytes=*/0);
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, decomposer.Run(module.get()));
-  EXPECT_TRUE(changed);
+  TF_ASSERT_OK_AND_ASSIGN(unique_ptr<HloModule> module, Transform(hlo));
   HloInstruction* recv = FindInstruction(module.get(), "recv");
   EXPECT_EQ(recv->channel_id().value(), 1);
   EXPECT_THAT(
@@ -309,11 +279,8 @@ TEST_F(CollectivePermuteDecomposerTest, ForwardPipeline2) {
     ROOT result = u32[2] get-tuple-element(while_result), index=1
   })";
 
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnUnverifiedModule((kModuleStr)));
-  CollectivePermuteDecomposer decomposer(/*threshold_in_bytes=*/0);
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, decomposer.Run(module.get()));
-  EXPECT_TRUE(changed);
+  TF_ASSERT_OK_AND_ASSIGN(unique_ptr<HloModule> module, Transform(kModuleStr));
+
   HloInstruction* recv = FindInstruction(module.get(), "recv");
   EXPECT_EQ(recv->channel_id().value(), 1);
   EXPECT_THAT(recv->ToString(),
@@ -400,11 +367,7 @@ TEST_F(CollectivePermuteDecomposerTest, ForwardPipelineWithMatmul) {
     ROOT data_out = f32[2,2] get-tuple-element(while_result), index=1
   }
   )";
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnUnverifiedModule((kModuleStr)));
-  CollectivePermuteDecomposer decomposer(/*threshold_in_bytes=*/0);
-  TF_ASSERT_OK_AND_ASSIGN(bool changed, decomposer.Run(module.get()));
-  EXPECT_TRUE(changed);
+  TF_ASSERT_OK_AND_ASSIGN(unique_ptr<HloModule> module, Transform(kModuleStr));
   HloModule* transformed_module = module.get();
   // Check the annotations and ordering of the decomposed send-recv pairs.
   // We expect the recv to come before the send in the while body, both for the
@@ -459,7 +422,7 @@ TEST_F(CollectivePermuteDecomposerTest, ForwardPipelineWithMatmul) {
 }
 
 TEST_F(CollectivePermuteDecomposerTest, BackwardPipeline2) {
-  const char* const kModuleStr = R"(
+  string_view hlo = R"(
   HloModule module
   cond {
     param = (u32[], u32[2]) parameter(0)
@@ -505,8 +468,7 @@ TEST_F(CollectivePermuteDecomposerTest, BackwardPipeline2) {
     ROOT result = u32[2] get-tuple-element(while_result), index=1
   })";
 
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnUnverifiedModule((kModuleStr)));
+  TF_ASSERT_OK_AND_ASSIGN(unique_ptr<HloModule> module, Transform(hlo));
   CollectivePermuteDecomposer decomposer(/*threshold_in_bytes=*/0);
   TF_ASSERT_OK_AND_ASSIGN(bool changed, decomposer.Run(module.get()));
   EXPECT_TRUE(changed);
@@ -539,7 +501,7 @@ TEST_F(CollectivePermuteDecomposerTest, BackwardPipeline2) {
 
 TEST_F(CollectivePermuteDecomposerTest,
        DecomposeCrossReplicaCollectivePermute) {
-  const char* const kModuleStr = R"(
+  string_view hlo = R"(
     HloModule module
     ENTRY body {
       data = f32[16] parameter(0)
@@ -547,8 +509,7 @@ TEST_F(CollectivePermuteDecomposerTest,
           source_target_pairs={{0,1}, {1,2}, {2,3}}
     }
   )";
-  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseAndReturnUnverifiedModule((kModuleStr)));
+  TF_ASSERT_OK_AND_ASSIGN(unique_ptr<HloModule> module, Transform(hlo));
 
   CollectivePermuteDecomposer decomposer(/*threshold_in_bytes=*/0);
   TF_ASSERT_OK_AND_ASSIGN(bool changed, decomposer.Run(module.get()));
