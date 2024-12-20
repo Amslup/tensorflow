@@ -12,16 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <stdio.h>
-
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "third_party/qairt/latest/include/QNN/HTP/QnnHtpDevice.h"
+#include "absl/strings/str_format.h"
 #include "tensorflow/lite/experimental/litert/c/litert_common.h"
 #include "tensorflow/lite/experimental/litert/c/litert_logging.h"
 #include "tensorflow/lite/experimental/litert/c/litert_model.h"
@@ -30,62 +29,55 @@
 #include "tensorflow/lite/experimental/litert/cc/litert_macros.h"
 #include "tensorflow/lite/experimental/litert/cc/litert_model.h"
 #include "tensorflow/lite/experimental/litert/vendors/c/litert_compiler_plugin.h"
-#include "tensorflow/lite/experimental/litert/vendors/qualcomm/compiler/qnn_compose_graph.h"
-#include "tensorflow/lite/experimental/litert/vendors/qualcomm/qnn_manager.h"
-
-using ::litert::qnn::QnnManager;
+#include "tensorflow/lite/experimental/litert/vendors/mediatek/compiler/compile_model.h"
+#include "tensorflow/lite/experimental/litert/vendors/mediatek/compiler/create_model.h"
+#include "tensorflow/lite/experimental/litert/vendors/mediatek/neuron_adapter.h"
 
 //
 // Configurations
 //
 
+using litert::Error;
+using litert::Expected;
+using litert::mediatek::NEURON_NO_ERROR;
+using litert::mediatek::NEURON_PREFER_SUSTAINED_SPEED;
+using litert::mediatek::NEURON_PRIORITY_HIGH;
+using litert::mediatek::NeuronAdapter;
+using litert::mediatek::NeuronCompilation;
+using litert::mediatek::NeuronCompilationPtr;
+using litert::mediatek::NeuronModel;
+using litert::mediatek::NeuronModelPtr;
+
 namespace {
 
-constexpr char kPluginManufacturer[] = "Qualcomm";
+constexpr char kPluginManufacturer[] = "MediaTek";
 
 // clang-format off
-constexpr std::pair<const char*, QnnHtpDevice_Arch_t> kPluginSocModels[] = {
-    {"V68", QNN_HTP_DEVICE_ARCH_V68},
-    {"V69", QNN_HTP_DEVICE_ARCH_V69},
-    {"V73", QNN_HTP_DEVICE_ARCH_V73},
-    {"V75", QNN_HTP_DEVICE_ARCH_V75},
-    {"V79", QNN_HTP_DEVICE_ARCH_V79},
+constexpr std::pair<const char*, const char*> kPluginSocModels[] = {
+    {"mt6853", "mt6853"},
+    {"mt6877", "mt6877"},
+    {"mt6878", "mt6878"},
+    {"mt6879", "mt6879"},
+    {"mt6886", "mt6886"},
+    {"mt6893", "mt6893"},
+    {"mt6895", "mt6895"},
+    {"mt6897", "mt6897"},
+    {"mt6983", "mt6983"},
+    {"mt6985", "mt6985"},
+    {"mt6989", "mt6989"},
+    {"mt6991", "mt6991"},
 };
 
 constexpr LiteRtOpCode kSupportedOps[] = {
-  kLiteRtOpCodeTflAdd,
-  kLiteRtOpCodeTflDiv,
-  kLiteRtOpCodeTflMul,
-  kLiteRtOpCodeTflRsqrt,
-  kLiteRtOpCodeTflSlice,
-  kLiteRtOpCodeTflSelect,
-  kLiteRtOpCodeTflSelectV2,
-  kLiteRtOpCodeTflSub,
-  kLiteRtOpCodeTflTanh,
-  kLiteRtOpCodeTflBatchMatmul,
-  kLiteRtOpCodeTflReshape,
-  kLiteRtOpCodeTflSum,
-  kLiteRtOpCodeTflConcatenation,
-  kLiteRtOpCodeTflSoftmax,
-  kLiteRtOpCodeTflCast,
-  kLiteRtOpCodeTflTranspose,
-  kLiteRtOpCodeTflSin,
-  kLiteRtOpCodeTflCos,
-  kLiteRtOpCodeTflFullyConnected,
-  kLiteRtOpCodeTflEmbeddingLookup,
-  kLiteRtOpCodeTflLogicalAnd,
-  kLiteRtOpCodeTflLess,
-  kLiteRtOpCodeTflGreater,
-  kLiteRtOpCodeTflGelu,
+    kLiteRtOpCodeTflAdd,
 };
 // clang-format on
 
 constexpr auto kNumPluginSocModels =
     sizeof(kPluginSocModels) / sizeof(kPluginSocModels[0]);
 
-std::optional<QnnHtpDevice_Arch_t> FindSocModel(
-    absl::string_view soc_model_name) {
-  std::optional<QnnHtpDevice_Arch_t> soc_model;
+std::optional<const char*> FindSocModel(absl::string_view soc_model_name) {
+  std::optional<const char*> soc_model;
   for (auto i = 0; i < kNumPluginSocModels; ++i) {
     if (soc_model_name == kPluginSocModels[i].first) {
       soc_model = kPluginSocModels[i].second;
@@ -148,7 +140,8 @@ LiteRtStatus LiteRtGetCompilerPluginSupportedSocModel(
 //
 
 struct LiteRtCompiledResultT {
-  std::vector<char> context_bin;
+  using Bytecode = std::vector<uint8_t>;
+  std::vector<Bytecode> bytecodes;
   std::vector<std::string> graph_names;
 };
 
@@ -157,9 +150,12 @@ LiteRtStatus LiteRtGetCompiledResultByteCode(
     size_t* byte_code_size) {
   if (!compiled_result || !byte_code || !byte_code_size) {
     return kLiteRtStatusErrorInvalidArgument;
+  } else if (compiled_result->bytecodes.size() > 1) {
+    LITERT_LOG(LITERT_ERROR, "CompilerPlugin API supports only 1 NPU bytecode");
+    return kLiteRtStatusErrorIndexOOB;
   }
-  *byte_code = compiled_result->context_bin.data();
-  *byte_code_size = compiled_result->context_bin.size();
+  *byte_code = compiled_result->bytecodes[0].data();
+  *byte_code_size = compiled_result->bytecodes[0].size();
   return kLiteRtStatusOk;
 }
 
@@ -172,8 +168,9 @@ LiteRtStatus LiteRtGetCompiledResultCallInfo(
     return kLiteRtStatusErrorIndexOOB;
   }
 
-  *call_info = compiled_result->graph_names.at(call_idx).data();
-  *call_info_size = compiled_result->graph_names.at(call_idx).size();
+  auto& graph_name = compiled_result->graph_names[call_idx];
+  *call_info = graph_name.data();
+  *call_info_size = graph_name.size();
 
   return kLiteRtStatusOk;
 }
@@ -183,7 +180,7 @@ LiteRtStatus LiteRtGetNumCompiledResultCalls(
   if (!compiled_result || !num_calls) {
     return kLiteRtStatusErrorInvalidArgument;
   }
-  *num_calls = compiled_result->graph_names.size();
+  *num_calls = compiled_result->bytecodes.size();
   return kLiteRtStatusOk;
 }
 
@@ -212,11 +209,8 @@ namespace {
 
 // TODO update this function to match the new legalizations.
 bool IsOpSupported(const litert::Op& op) {
-  // NOTE: Currently we are demoing by just mapping simple f32 mul ops.
-  // In the limit this function withh want to leverage QNN SDK's getSuportedOps
-  // feature (along with our op/type mappings).
-  // Use a very loose guard for now -- only checking if op code is supported.
-
+  // NOTE: Currently we are demoing by just mapping simple f32 mul ops.  Use a
+  // very loose guard for now -- only checking if op code is supported.
   for (auto supported_op : kSupportedOps) {
     if (op.Code() == supported_op) {
       return true;
@@ -230,7 +224,7 @@ bool IsOpSupported(const litert::Op& op) {
 LiteRtStatus LiteRtCompilerPluginPartition(LiteRtCompilerPlugin compiler_plugin,
                                            LiteRtSubgraph subgraph,
                                            LiteRtOpList selected_ops) {
-  ::litert::Subgraph graph(subgraph);
+  litert::Subgraph graph(subgraph);
   for (const auto& op : graph.Ops()) {
     if (!IsOpSupported(op)) {
       continue;
@@ -242,17 +236,53 @@ LiteRtStatus LiteRtCompilerPluginPartition(LiteRtCompilerPlugin compiler_plugin,
   return kLiteRtStatusOk;
 }
 
+namespace {
+
+Expected<std::vector<uint8_t>> CompilePartition(
+    NeuronAdapter& neuron_adapter, const litert::Subgraph& partition,
+    const std::string& graph_name) {
+  auto model = CreateModel(neuron_adapter, partition, graph_name);
+  if (!model) {
+    return model.Error();
+  }
+
+  auto compilation = CompileModel(neuron_adapter, model->get());
+  if (!compilation) {
+    return compilation.Error();
+  }
+
+  size_t bytecode_size;
+  if (neuron_adapter.api().compilation_get_compiled_network_size(
+          compilation->get(), &bytecode_size) != NEURON_NO_ERROR) {
+    return Error(kLiteRtStatusErrorRuntimeFailure,
+                 "Failed to get compiled network size");
+  }
+
+  std::vector<uint8_t> bytecode(bytecode_size);
+  if (neuron_adapter.api().compilation_store_compiled_network(
+          compilation->get(), bytecode.data(), bytecode.size()) !=
+      NEURON_NO_ERROR) {
+    return Error(kLiteRtStatusErrorRuntimeFailure,
+                 "Failed to get compiled network");
+  }
+
+  return bytecode;
+}
+
+}  // namespace
+
 LiteRtStatus LiteRtCompilerPluginCompile(
     LiteRtCompilerPlugin compiler_plugin, const char* soc_model,
     LiteRtSubgraph* partitions, LiteRtParamIndex num_partitions,
     LiteRtCompiledResult* compiled_result) {
   LITERT_LOG(LITERT_INFO,
-             "Starting QNN Compilation for %d subgraphs, soc_model=%s",
+             "Starting MediaTek Compilation for %d subgraphs, soc_model=%s",
              num_partitions, soc_model);
 
   auto opt_soc_model = soc_model ? FindSocModel(soc_model) : std::nullopt;
   if (opt_soc_model) {
-    LITERT_LOG(LITERT_ERROR, "Compiling QNN architecture: %d", *opt_soc_model);
+    LITERT_LOG(LITERT_ERROR, "Compiling for MediaTek architecture: %s",
+               *opt_soc_model);
   } else if (soc_model) {
     LITERT_LOG(LITERT_ERROR, "Unexpected SoC model: %s", soc_model);
     return kLiteRtStatusErrorInvalidArgument;
@@ -260,51 +290,26 @@ LiteRtStatus LiteRtCompilerPluginCompile(
 
   // Initialize SDK and load qnn shared libraries.
 
-  LITERT_LOG(LITERT_INFO, "%s", "Creating QNN manager");
-  auto backend_configs = QnnManager::DefaultBackendConfigs();
-  auto qnn_manager = QnnManager::Create(
-      backend_configs, /*shared_library_dir=*/std::nullopt, opt_soc_model);
-  if (!qnn_manager) {
-    LITERT_LOG(LITERT_ERROR, "%s", qnn_manager.Error().Message().data());
-    return qnn_manager.Error().Status();
+  auto neuron_adapter =
+      NeuronAdapter::Create(/*shared_library_dir=*/std::nullopt);
+  if (!neuron_adapter) {
+    return neuron_adapter.Error().Status();
   }
-  LITERT_LOG(LITERT_INFO, "%s", "QNN manager created");
-
-  // Initialize context.
-
-  LITERT_LOG(LITERT_INFO, "%s", "Creating context handle");
-  auto context_configs = QnnManager::DefaultContextConfigs();
-  auto context_handle = (*qnn_manager)->CreateContextHandle(context_configs);
-  if (!context_handle) {
-    LITERT_LOG(LITERT_ERROR, "%s", context_handle.Error().Message().data());
-    return context_handle.Error().Status();
-  }
-  LITERT_LOG(LITERT_INFO, "%s", "Context handle created");
 
   auto result = std::make_unique<LiteRtCompiledResultT>();
+  for (auto i = 0; i < num_partitions; ++i) {
+    auto partition = litert::Subgraph(partitions[i]);
+    auto graph_name = absl::StrFormat("Partition_%d", i);
+    auto bytecode = CompilePartition(**neuron_adapter, partition, graph_name);
+    if (!bytecode) {
+      LITERT_LOG(LITERT_INFO, "%s", bytecode.Error().Message().data());
+      return bytecode.Error().Status();
+    }
 
-  // Compose graphs.
-
-  LITERT_LOG(LITERT_INFO, "%s", "Composing graph(s)");
-  // TODO: Support multiple partitions in QCC plugin compile.
-  LITERT_ENSURE_SUPPORTED(num_partitions, 1);
-  {
-    std::string& entry_point_name = result->graph_names.emplace_back();
-    entry_point_name = "qnn_partition_0";
-    LITERT_RETURN_STATUS_IF_NOT_OK(litert::qnn::ComposeGraph(
-        **qnn_manager, context_handle->get(), partitions[0], entry_point_name));
+    result->bytecodes.emplace_back(*bytecode);
+    result->graph_names.emplace_back(graph_name);
   }
-  LITERT_LOG(LITERT_INFO, "%s", "Graph composed");
-
-  // Generate context binary.
-
-  LITERT_LOG(LITERT_INFO, "%s", "Generating context binary");
-  LITERT_RETURN_STATUS_IF_NOT_OK(
-      (*qnn_manager)
-          ->GenerateContextBinary(context_handle->get(), result->context_bin));
-  LITERT_LOG(LITERT_INFO, "%s", "Context binary generated");
 
   *compiled_result = result.release();
-
   return kLiteRtStatusOk;
 }
