@@ -137,6 +137,7 @@ cc_library(
         "//xla/python/ifrt_proxy/common:types",
         "//xla/python/ifrt_proxy/common:types_proto_cc",
         "//xla/python/pjrt_ifrt:xla_ifrt",
+        "//xla/python/pjrt_ifrt:xla_sharding_serdes",
         "//xla/tsl/concurrency:ref_count",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/cleanup",
