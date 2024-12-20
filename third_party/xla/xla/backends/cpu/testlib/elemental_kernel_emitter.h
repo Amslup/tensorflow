@@ -16,35 +16,50 @@ limitations under the License.
 #ifndef XLA_BACKENDS_CPU_TESTLIB_ELEMENTAL_KERNEL_EMITTER_H_
 #define XLA_BACKENDS_CPU_TESTLIB_ELEMENTAL_KERNEL_EMITTER_H_
 
+#include <functional>
 #include <memory>
 
-#include "absl/functional/any_invocable.h"
 #include "absl/status/statusor.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/Intrinsics.h"
-#include "llvm/IR/Module.h"
-#include "llvm/IR/Value.h"
 #include "xla/backends/cpu/codegen/kernel_api_ir_builder.h"
 #include "xla/codegen/kernel_emitter.h"
 #include "xla/codegen/kernel_spec.h"
 #include "xla/hlo/ir/hlo_instruction.h"
-#include "xla/service/elemental_ir_emitter.h"
+#include "xla/service/buffer_assignment.h"
+#include "xla/service/cpu/elemental_ir_emitter.h"
+#include "xla/service/llvm_ir/loop_emitter.h"
+#include "xla/stream_executor/launch_dim.h"
 
 namespace xla::cpu {
 
 class ElementalKernelEmitter final : public KernelEmitter {
  public:
-  using ElementalIrEmitterFactory =
-      absl::AnyInvocable<std::unique_ptr<ElementalIrEmitter>(
-          llvm::Module*, llvm::IRBuilderBase*)>;
+  // we want to be able to copy this on each invocation of EmitKernelSpec
+  using ThreadLocalCallCallback =
+      std::function<CpuElementalIrEmitter::ThreadLocalCallPrototype>;
 
-  explicit ElementalKernelEmitter(std::unique_ptr<HloInstruction> op_hlo);
+  ElementalKernelEmitter(std::unique_ptr<HloInstruction> op_hlo,
+                         ThreadLocalCallCallback thread_local_call_fn);
 
   absl::StatusOr<std::unique_ptr<KernelSpec>> EmitKernelSpec() override;
 
  private:
+  // Emits LLVM IR using elemental loop emitter and the given element generator.
+  // If the instruction is parallelized, it will emit a parallel loop partition
+  // and return the requested number of execution threads.
+  absl::StatusOr<se::ThreadDim> EmitElementalLoops(
+      llvm::IRBuilderBase& b, const HloInstruction* instr,
+      const KernelApiIrBuilder::KernelPrototype& kernel_prototype,
+      const llvm_ir::ElementGenerator& element_generator);
+
+ private:
   std::unique_ptr<HloInstruction> op_hlo_;
+  ThreadLocalCallCallback thread_local_call_fn_;
+
+  // TODO(willfroom): fill in buffer assignment when we support creation from a
+  // real HLO instruction.
+  const BufferAssignment* buffer_assignment_ = nullptr;
 
   llvm::orc::ThreadSafeContext context_;
 
